@@ -31,3 +31,14 @@ jobs:
           git diff --cached --quiet || git commit -m "data $(date -u +'%Y-%m-%d %H:%M UTC')"
           git pull --rebase
           git push
+
+      - name: Poslat chybu na Telegram
+        if: failure()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=Paper trader: hodinové kolo selhalo. Detail: ${RUN_URL}" > /dev/null
