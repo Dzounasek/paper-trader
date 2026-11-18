@@ -2,7 +2,7 @@ name: tick
 
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "3-59/10 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -20,25 +20,33 @@ jobs:
       - name: Stáhnout repozitář
         uses: actions/checkout@v4
 
-      - name: Jedno kolo obchodníka
-        run: python3 paper_trader.py --once
+      - name: Jedno kolo obchodníka a hodinový přehled
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 paper_trader.py --once --notify
 
       - name: Uložit data zpět do repozitáře
         run: |
           git config user.name "paper-trader-bot"
           git config user.email "paper-trader-bot@users.noreply.github.com"
-          git add data
+          git add data_cfd
           git diff --cached --quiet || git commit -m "data $(date -u +'%Y-%m-%d %H:%M UTC')"
           git pull --rebase
           git push
 
-      - name: Poslat chybu na Telegram
+      - name: Poslat chybu na Telegram (nejvýš jednou za hodinu)
         if: failure()
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=Paper trader: hodinové kolo selhalo. Detail: ${RUN_URL}" > /dev/null
+          MIN=$(date -u +%M | sed 's/^0*//')
+          MIN=${MIN:-0}
+          if [ "$MIN" -lt 10 ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=Paper trader: kolo selhalo. Detail: ${RUN_URL}" > /dev/null
+          fi
