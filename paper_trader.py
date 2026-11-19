@@ -5,7 +5,8 @@ paper_trader.py (multi-asset CFD simulace) - papírový obchodník. ŽÁDNÉ SKU
 
 Simuluje obchodování CFD na akciích, ETF (indexy, zlato) a kryptoměnách: LONG i SHORT,
 spread v USD na kus, noční poplatek (22:00 GMT, jiná sazba pro Long a Short), FX poplatek,
-close-out při velké ztrátě (jako u EU brokerů). Parametry podle údajů z Trading 212 CFD.
+stop-loss, take-profit, close-out při velké ztrátě (jako u EU brokerů).
+Parametry podle údajů z Trading 212 CFD.
 Každé spuštění udělá JEDNO kolo (plánovač ho pouští každých ~10 minut).
 
 Ceny: US akcie a ETF z Finnhubu (potřebuje zdarma klíč FINNHUB_API_KEY),
@@ -62,12 +63,13 @@ INSTRUMENTS = [
 ]
 
 # Parametry podle třídy. Páka odpovídá limitům ESMA pro EU retail klienty.
+# stop-loss a take-profit jsou vzdálenosti od vstupní ceny (take-profit 0 = vypnuto).
 CLASS = {
-    #           páka  stop-loss  pásmo signálu
-    "index":  {"lev": 20, "stop": 0.015, "band": 0.0030},
-    "gold":   {"lev": 20, "stop": 0.015, "band": 0.0030},
-    "stock":  {"lev": 5,  "stop": 0.030, "band": 0.0080},
-    "crypto": {"lev": 2,  "stop": 0.040, "band": 0.0080},
+    #           páka  stop-loss  take-profit  pásmo signálu
+    "index":  {"lev": 20, "stop": 0.015, "tp": 0.030, "band": 0.0030},
+    "gold":   {"lev": 20, "stop": 0.015, "tp": 0.030, "band": 0.0030},
+    "stock":  {"lev": 5,  "stop": 0.030, "tp": 0.060, "band": 0.0080},
+    "crypto": {"lev": 2,  "stop": 0.040, "tp": 0.080, "band": 0.0080},
 }
 
 # Noční poplatek (overnight): strhává se denně v 22:00 GMT (UTC) z hodnoty pozice
@@ -87,6 +89,7 @@ FAST_N = 6                   # krátký klouzavý průměr (počet kol; při 10 
 SLOW_N = 24                  # dlouhý klouzavý průměr (počet kol; při 10 min = 4 hodiny)
 CLOSEOUT_LEVEL = 0.5         # při poklesu účtu na 50 % použité marže se pozice zavírá (ESMA)
 MAX_STALE_MIN = 30           # cena starší než 30 minut = nepoužije se (svátek, přerušení)
+MAX_GAP_MIN = 120            # díra v datech delší než 2 h během otevřeného trhu = historie se zahodí
 POLL_MIN = 10                # jak často se kolo spouští (jen pro výpočty a texty)
 REPORT_TZ = "Europe/Prague"  # časová zóna, ve které se píší časy v reportu
 DEMO_TICKS = 3000            # kolik kol (po 10 minutách) proběhne v režimu --demo
@@ -97,7 +100,7 @@ INFO = {}
 for _sym, _src, _cls, _label, _spread, _fl, _fs in INSTRUMENTS:
     INFO[_sym] = dict(CLASS[_cls], src=_src, cls=_cls, label=_label, spread=_spread,
                       fin_long=_fl / 100.0, fin_short=_fs / 100.0)
-FMT = 2                  # verze formátu dat (kvůli přechodu ze starší verze)
+FMT = 3                  # verze formátu dat (kvůli přechodu ze starší verze)
 TICKS_PER_DAY = int(24 * 60 / POLL_MIN)
 
 DEMO = "--demo" in sys.argv
@@ -295,7 +298,8 @@ def spy_hold(s, prices):
 
 
 # --------------------------- obchodování ---------------------------
-TRADE_HEADER = ["time", "symbol", "action", "side", "price", "notional_usd", "pnl_usd", "reason"]
+TRADE_HEADER = ["time", "symbol", "action", "side", "price", "notional_usd", "pnl_usd", "reason",
+                "entry_price", "stop_price", "tp_price", "opened", "fees_usd"]
 EQUITY_HEADER = ["time", "equity_usd", "buyhold_usd", "spy_usd"]
 
 
@@ -308,13 +312,21 @@ def open_pos(s, sym, side, price, reason, prices):
     half = info["spread"] / 2
     entry = price + half if side == "LONG" else price - half
     units = notional / entry
+    if side == "LONG":
+        stop_price = price * (1 - info["stop"])
+        tp_price = price * (1 + info["tp"]) if info["tp"] else 0.0
+    else:
+        stop_price = price * (1 + info["stop"])
+        tp_price = price * (1 - info["tp"]) if info["tp"] else 0.0
     s["pos"][sym] = {"side": side, "units": units, "entry": entry, "mid_entry": price,
+                     "stop_price": stop_price, "tp_price": tp_price,
                      "margin": margin, "notional": notional, "spread": info["spread"],
                      "fin_rate": info["fin_long"] if side == "LONG" else info["fin_short"],
                      "opened": now(), "fin_ts": now_dt().timestamp(), "fin_paid": 0.0}
     s["spread_paid"] += units * half
     append_csv(F_TRADES, TRADE_HEADER,
-               [now(), sym, "OPEN", side, round(entry, 4), round(notional, 2), "", reason])
+               [now(), sym, "OPEN", side, round(entry, 4), round(notional, 2), "", reason,
+                round(entry, 4), round(stop_price, 4), round(tp_price, 4) if tp_price else "", now(), ""])
     return True
 
 
@@ -334,7 +346,9 @@ def close_pos(s, sym, price, reason):
     net = gross - fx - p["fin_paid"]    # noční poplatky už byly strženy průběžně
     append_csv(F_TRADES, TRADE_HEADER,
                [now(), sym, "CLOSE", p["side"], round(exit_px, 4), round(p["notional"], 2),
-                round(net, 4), reason])
+                round(net, 4), reason, round(p["entry"], 4), round(p["stop_price"], 4),
+                round(p["tp_price"], 4) if p["tp_price"] else "", p["opened"],
+                round(p["fin_paid"] + fx, 4)])
 
 
 def rollovers_between(t0, t1):
@@ -382,12 +396,17 @@ def trade_logic(s, sym, h, prices):
     price = h[-1][1]
     pos = s["pos"].get(sym)
 
-    if pos:  # stop-loss proti směru pozice
-        if pos["side"] == "LONG" and price <= pos["mid_entry"] * (1 - info["stop"]):
+    if pos:  # stop-loss a take-profit podle hladin uložených při otevření
+        sl, tp = pos["stop_price"], pos["tp_price"]
+        if pos["side"] == "LONG":
+            hit_stop, hit_tp = price <= sl, bool(tp) and price >= tp
+        else:
+            hit_stop, hit_tp = price >= sl, bool(tp) and price <= tp
+        if hit_stop:
             close_pos(s, sym, price, "stop-loss")
             return
-        if pos["side"] == "SHORT" and price >= pos["mid_entry"] * (1 + info["stop"]):
-            close_pos(s, sym, price, "stop-loss")
+        if hit_tp:
+            close_pos(s, sym, price, "take-profit")
             return
 
     if len(h) < SLOW_N + 1:
@@ -420,6 +439,26 @@ def trade_logic(s, sym, h, prices):
             open_pos(s, sym, "SHORT", price, "trend dolu", prices)
 
 
+def ny_day(ts):
+    t = datetime.fromtimestamp(ts, timezone.utc)
+    try:
+        return t.astimezone(ZoneInfo("America/New_York")).date()
+    except Exception:
+        return (t - timedelta(hours=5)).date()
+
+
+def gap_resets_history(sym, last_ts, ts):
+    """Díra v datech (např. když GitHub nespustil kola) by zkreslila klouzavé průměry.
+    Krypto: díra > MAX_GAP_MIN = konec historie. Akcie: noc, víkend a svátek jsou normální,
+    díra uvnitř jednoho obchodního dne (nebo delší než 5 dní) ne."""
+    gap = ts - last_ts
+    if gap <= MAX_GAP_MIN * 60:
+        return False
+    if INFO[sym]["src"] == "crypto":
+        return True
+    return ny_day(last_ts) == ny_day(ts) or gap > 5 * 86400
+
+
 def fetch_all(s, quote_fn, ts):
     """Stáhne ceny všech nástrojů. Vrací (slovník sym -> čerstvá cena, statistiky zdrojů)."""
     got = {}
@@ -443,6 +482,9 @@ def fetch_all(s, quote_fn, ts):
         st["ok"] += 1
         st["age"] = max(st["age"], age)
         h = s["hist"].setdefault(sym, [])
+        if h and gap_resets_history(sym, h[-1][0], ts):
+            h.clear()                       # začneme sbírat historii znovu
+            s["trend"].pop(sym, None)
         h.append([ts, price])
         del h[:-(SLOW_N + 5)]
         s["start_prices"].setdefault(sym, price)
@@ -549,17 +591,48 @@ def max_drawdown(rows):
     return worst
 
 
+def fmt_px(x):
+    return money(float(x))
+
+
+def fmt_dur(td):
+    mins = int(td.total_seconds() // 60)
+    if mins < 60:
+        return "%d min" % mins
+    if mins < 24 * 60:
+        return "%d h %d min" % (mins // 60, mins % 60)
+    return "%d d %d h" % (mins // (24 * 60), (mins % (24 * 60)) // 60)
+
+
 def pos_line(s, sym, price):
     p = s["pos"][sym]
-    return "%s %s (hodnota %s USD, nerealizovaně %+.2f USD)" % (
-        sym, p["side"], money(p["units"] * price), pos_pnl(p, price))
+    pnl = pos_pnl(p, price)
+    tp = fmt_px(p["tp_price"]) if p["tp_price"] else "není"
+    return "%s %s: vstup %s, teď %s, nerealizovaně %+.2f USD (%+.2f %% z hodnoty pozice) | stop-loss %s | take-profit %s" % (
+        sym, p["side"], fmt_px(p["entry"]), fmt_px(price), pnl, pnl / p["notional"] * 100,
+        fmt_px(p["stop_price"]), tp)
 
 
-def trade_text(r):
+def trade_detail(r):
+    """Podrobný popis jednoho obchodu (otevření nebo zavření)."""
+    t = local(parse_ts(r["time"])).strftime("%d.%m. %H:%M")
+    levels = "stop-loss %s, take-profit %s" % (
+        fmt_px(r["stop_price"]) if r.get("stop_price") else "není",
+        fmt_px(r["tp_price"]) if r.get("tp_price") else "není")
     if r["action"] == "OPEN":
-        return "OTEVŘENO %s %s @ %s (%s)" % (r["side"], r["symbol"], money(float(r["price"])), r["reason"])
-    return "ZAVŘENO %s %s @ %s, výsledek %+.2f USD (%s)" % (
-        r["side"], r["symbol"], money(float(r["price"])), float(r["pnl_usd"]), r["reason"])
+        return "\n".join([
+            "%s OTEVŘENO %s %s" % (t, r["side"], r["symbol"]),
+            "   vstup %s USD, hodnota pozice %s USD" % (fmt_px(r["price"]), fmt_px(r["notional_usd"])),
+            "   " + levels,
+            "   důvod: " + r["reason"]])
+    pnl = float(r["pnl_usd"])
+    held = parse_ts(r["time"]) - parse_ts(r["opened"])
+    return "\n".join([
+        "%s ZAVŘENO %s %s (%s) %s" % (t, r["side"], r["symbol"], r["reason"], "✔" if pnl > 0 else "✖"),
+        "   vstup %s -> výstup %s USD, držel %s" % (fmt_px(r["entry_price"]), fmt_px(r["price"]), fmt_dur(held)),
+        "   " + levels,
+        "   výsledek %+.2f USD (%+.2f %% z hodnoty pozice), v tom poplatky %s USD" % (
+            pnl, pnl / float(r["notional_usd"]) * 100, fmt_px(r["fees_usd"] or 0))])
 
 
 def data_health_lines(s):
@@ -610,9 +683,13 @@ def build_short_report():
     else:
         out.append("Otevřené pozice: žádné")
     if new:
-        out.append("Za poslední hodinu:")
-        for r in new:
-            out.append(" - " + trade_text(r))
+        out.append("")
+        out.append("OBCHODY ZA POSLEDNÍ HODINU (%d):" % len(new))
+        for r in new[-6:]:
+            out.append(trade_detail(r))
+        if len(new) > 6:
+            out.append("(dalších %d starších obchodů vynecháno)" % (len(new) - 6))
+        out.append("")
     else:
         out.append("Za poslední hodinu: žádný obchod")
     out.append("Trh USA: %s | kol za hodinu: %d z %d" % (
@@ -684,11 +761,12 @@ def build_report():
         out.append("Zatím žádný zavřený obchod.")
     last = [r for r in trades if parse_ts(r["time"]) > since24]
     if last:
-        out.append("Za posledních 24 h (%d):" % len(last))
-        for r in last[-8:]:
-            out.append(" - %s %s" % (local(parse_ts(r["time"])).strftime("%H:%M"), trade_text(r)))
-        if len(last) > 8:
-            out.append(" - (dalších %d starších obchodů vynecháno)" % (len(last) - 8))
+        out.append("")
+        out.append("OBCHODY ZA POSLEDNÍCH 24 H (%d):" % len(last))
+        for r in last[-6:]:
+            out.append(trade_detail(r))
+        if len(last) > 6:
+            out.append("(dalších %d starších obchodů vynecháno)" % (len(last) - 6))
     else:
         out.append("Za posledních 24 h: žádné obchody")
 
