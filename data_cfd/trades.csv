@@ -1,2 +1,4 @@
 time,symbol,action,side,price,notional_usd,pnl_usd,reason,entry_price,stop_price,tp_price,opened,fees_usd
 2026-11-20 22:40:38,BTC,OPEN,LONG,59079.82,1000.0,,trend nahoru,59079.82,56688.6,63774.675,2026-11-20 22:40:38,
+2026-11-21 03:40:37,BTC,CLOSE,LONG,56967.62,1000.0,-35.9304,obrat dolu,59079.82,56688.6,63774.675,2026-11-20 22:40:38,0.1788
+2026-11-21 03:40:37,BTC,OPEN,SHORT,56967.62,1000.0,,trend dolu,56967.62,59276.6876,52437.0698,2026-11-21 03:40:37,
